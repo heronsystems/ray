@@ -1,3 +1,4 @@
+import gym
 import json
 import os
 import logging
@@ -13,7 +14,7 @@ import ray
 from ray.rllib.env.base_env import BaseEnv, _DUMMY_AGENT_ID, ASYNC_RESET_RETURN
 
 logger = logging.getLogger(__name__)
-ZMQ_CONNECT_METHOD = 'icp'
+ZMQ_CONNECT_METHOD = 'ipc'
 
 
 def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
@@ -23,17 +24,18 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
     Copyright (c) 2017 OpenAI (http://openai.com)
     """
     parent_remote.close()
-    env = env_fn_wrapper.x()
+    env_fn, env_id = env_fn_wrapper.x
+    env = env_fn(env_id)
 
     shared_memory = {}
-    print(env.observation_space)
-    for name, shape in env.observation_space.items():
-        if shape is not None:
-            if not shape.dtype:
-                tensor = torch.FloatTensor(*shape)
-            else:
-                tensor = torch.zeros(*shape, dtype=shape.dtype)
-            shared_memory[name] = tensor
+    for name, space in env.observation_space.spaces.items():
+        if isinstance(space, gym.spaces.Box):
+            if space.dtype != np.float32:
+                raise NotImplementedError('Type not implemented {}'.format(space.dtype))
+            tensor = torch.zeros(space.shape, dtype=torch.float32)
+        elif isinstance(space, gym.spaces.dict.Dict):
+            raise NotImplementedError('Gym dict spaces not supported')
+        shared_memory[name] = tensor
 
     # initial python pipe setup
     python_pipe = True
@@ -65,9 +67,15 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
             # commands that aren't action dictionaries
             if socket_parsed == 'reset':
                 ob = env.reset()
-                ob = handle_ob(ob, shared_memory)
+                # MUST return ob, reward, done, info
+                # TODO: should be different for not multi agent env
+                reward = {agent_id: 0 for agent_id in ob.keys()}
+                done = {"__all__": False}
+                info = {agent_id: {} for agent_id in ob.keys()}
                 # only the non-shared obs are returned here
-                socket.send(json.dumps(ob).encode(), zmq.NOBLOCK, copy=False, track=False)
+                non_shared_ob = handle_ob(ob, shared_memory)
+                msg = json.dumps((non_shared_ob, reward, done, info))
+                socket.send(msg.encode(), zmq.NOBLOCK, copy=False, track=False)
             elif socket_parsed == 'close':
                 env.close()
                 running = False
@@ -75,8 +83,12 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
             else:
                 action_dictionary = json.loads(socket_parsed)
                 ob, reward, done, info = env.step(action_dictionary)
-                if done:
-                    ob = env.reset()
+                # Done ob handled by reset
+                # if isinstance(done, dict):
+                    # if done['__all__']:
+                        # ob = env.reset()
+                # elif done:
+                    # ob = env.reset()
                 ob = handle_ob(ob, shared_memory)
                 # only the non-shared obs are returned here
                 msg = json.dumps((ob, reward, done, info))
@@ -91,15 +103,19 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
 
 
 def handle_ob(ob, shared_memory):
-    print('obs', ob)
     non_shared = {}
     for k, v in ob.items():
         if isinstance(v, torch.Tensor):
             shared_memory[k].copy_(v)
+        elif isinstance(v, np.ndarray):
+            shared_memory[k].copy_(torch.from_numpy(v))
         # support double layer dict
         elif isinstance(v, dict):
-            print(v)
-            exit()
+            for nk, nv in v.items():
+                if isinstance(nv, dict):
+                    raise NotImplementedError('Nested obs space dict not implemented')
+                shared_memory[k][nk] = torch.from_numpy(nv)
         else:
-            non_shared[k] = v
+            raise NotImplementedError('Unsupported obs type {}'.format(type(v)))
+            # non_shared[k] = v
     return non_shared

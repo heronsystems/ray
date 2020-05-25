@@ -80,7 +80,7 @@ class BaseEnv:
                     remote_env_batch_wait_ms=0):
         """Wraps any env type as needed to expose the async interface."""
 
-        from ray.rllib.env.zmq_vector_env import ZMQRemoteVectorEnv as RemoteVectorEnv
+        from ray.rllib.env.zmq_remote_env import ZMQRemoteVectorEnv as RemoteVectorEnv
         if remote_envs and num_envs == 1:
             raise ValueError(
                 "Remote envs only make sense to use if num_envs > 1 "

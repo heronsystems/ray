@@ -49,8 +49,8 @@ class ZMQRemoteVectorEnv(BaseEnv):
         for e_id, remote in self._zmq_sockets.items():
             result = remote.recv()
             self._check_for_errors(result, e_id)
-            _, rew, done, info = remote.recv()
-            obs[e_id] = self.shared_memories[e_id]
+            _, rew, done, info = json.loads(result.decode())
+            obs[e_id] = self._obs_to_numpy(self.shared_memories[e_id])
             rewards[e_id] = rew
             dones[e_id] = done
             infos[e_id] = info
@@ -61,17 +61,16 @@ class ZMQRemoteVectorEnv(BaseEnv):
     def send_actions(self, action_dict):
         for env_id, actions in action_dict.items():
             socket = self._zmq_sockets[env_id]
-            msg = json.dumps({k: v for k, v in actions.items()})
+            # TODO: support nested action dict?
+            msg = json.dumps({k: v.item() for k, v in actions.items()})
             socket.send(msg.encode(), zmq.NOBLOCK, copy=False, track=False)
 
         self.waiting = True
 
     def try_reset(self, env_id):
-        raise NotImplementedError('when is this called?' + str(env_id))
-        # actor = self.actors[env_id]
-        # obj_id = actor.reset.remote()
-        # self.pending[obj_id] = actor
-        # return ASYNC_RESET_RETURN
+        # only reset the env
+        self._zmq_sockets[env_id].send('reset'.encode())
+        return ASYNC_RESET_RETURN
 
     def stop(self):
         if self.closed:
@@ -128,61 +127,38 @@ class ZMQRemoteVectorEnv(BaseEnv):
         all_info = {}
         all_done = {}
         for r_ind, remote in self._zmq_sockets.items():
-            wait_for_worker = json.loads(remote.recv().decode())
-            all_obs[r_ind] = self.shared_memories[r_ind]
+            result = remote.recv().decode()
+            self._check_for_errors(result, r_ind)
+            _, rew, done, info = json.loads(result)
+
+            all_obs[r_ind] = self._obs_to_numpy(self.shared_memories[r_ind])
             # each keyed by agent_id in the env
-            all_rew[r_ind] = {agent_id: 0 for agent_id in all_obs[r_ind].keys()}
-            all_info[r_ind] = {agent_id: {} for agent_id in all_obs[r_ind].keys()}
-            all_done[r_ind] = {"__all__": False}
+            all_rew[r_ind] = rew
+            all_info[r_ind] = info
+            all_done[r_ind] = done
 
         return all_obs, all_rew, all_done, all_info
+
+    @staticmethod
+    def _obs_to_numpy(obs):
+        o = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                o[k] = v.numpy()
+            # support double layer dict
+            elif isinstance(v, dict):
+                for nk, nv in v.items():
+                    if isinstance(nv, dict):
+                        raise NotImplementedError('Nested obs space dict not implemented')
+                    o[k][nk] = nv.numpy()
+            else:
+                raise NotImplementedError('Unsupported obs type {}'.format(type(v)))
+        return o
 
     def _check_for_errors(self, result, e_id):
         if result[:5] == b'error':
             error = 'Worker {} has an error {}'.format(e_id, result)
             raise WorkerError(error)
-
-
-@ray.remote(num_cpus=0)
-class _RemoteMultiAgentEnv:
-    """Wrapper class for making a multi-agent env a remote actor."""
-
-    def __init__(self, make_env, i):
-        self.env = make_env(i)
-
-    def reset(self):
-        obs = self.env.reset()
-        # each keyed by agent_id in the env
-        rew = {agent_id: 0 for agent_id in obs.keys()}
-        info = {agent_id: {} for agent_id in obs.keys()}
-        done = {"__all__": False}
-        return obs, rew, done, info
-
-    def step(self, action_dict):
-        return self.env.step(action_dict)
-
-
-@ray.remote(num_cpus=0)
-class _RemoteSingleAgentEnv:
-    """Wrapper class for making a gym env a remote actor."""
-
-    def __init__(self, make_env, i):
-        self.env = make_env(i)
-
-    def reset(self):
-        obs = {_DUMMY_AGENT_ID: self.env.reset()}
-        rew = {agent_id: 0 for agent_id in obs.keys()}
-        info = {agent_id: {} for agent_id in obs.keys()}
-        done = {"__all__": False}
-        return obs, rew, done, info
-
-    def step(self, action):
-        obs, rew, done, info = self.env.step(action[_DUMMY_AGENT_ID])
-        obs, rew, done, info = [{
-            _DUMMY_AGENT_ID: x
-        } for x in [obs, rew, done, info]]
-        done["__all__"] = done[_DUMMY_AGENT_ID]
-        return obs, rew, done, info
 
 
 class CloudpickleWrapper(object):
