@@ -1,7 +1,9 @@
+from collections import OrderedDict
 import gym
 import json
 import os
 import logging
+import traceback
 import pickle
 
 import cloudpickle
@@ -14,7 +16,7 @@ import ray
 from ray.rllib.env.base_env import BaseEnv, _DUMMY_AGENT_ID, ASYNC_RESET_RETURN
 
 logger = logging.getLogger(__name__)
-ZMQ_CONNECT_METHOD = 'ipc'
+ZMQ_CONNECT_METHOD = 'tcp'
 
 
 def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
@@ -27,15 +29,24 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
     env_fn, env_id = env_fn_wrapper.x
     env = env_fn(env_id)
 
-    shared_memory = {}
+    shared_memory = OrderedDict({})
     for name, space in env.observation_space.spaces.items():
         if isinstance(space, gym.spaces.Box):
             if space.dtype != np.float32:
                 raise NotImplementedError('Type not implemented {}'.format(space.dtype))
             tensor = torch.zeros(space.shape, dtype=torch.float32)
+            shared_memory[name] = tensor
         elif isinstance(space, gym.spaces.dict.Dict):
-            raise NotImplementedError('Gym dict spaces not supported')
-        shared_memory[name] = tensor
+            sm = OrderedDict({})
+            for nk, ns in space.spaces.items():
+                if isinstance(ns, gym.spaces.Box):
+                    if ns.dtype != np.float32:
+                        raise NotImplementedError('Type not implemented {}'.format(ns.dtype))
+                    tensor = torch.zeros(ns.shape, dtype=torch.float32)
+                elif isinstance(space, gym.spaces.dict.Dict):
+                    raise NotImplementedError('Gym nested dict spaces not supported')
+                sm[nk] = tensor
+            shared_memory[name] = sm
 
     # initial python pipe setup
     python_pipe = True
@@ -98,12 +109,13 @@ def zmq_worker(remote, parent_remote, port, env_fn_wrapper):
         except Exception as e:
             running = False
             e_str = '{}: {}'.format(type(e).__name__, e)
+            e_str += '\n' + traceback.format_exc()
             print('Subprocess environment has an error', e_str)
             socket.send('error. {}'.format(e_str).encode(), zmq.NOBLOCK, copy=False, track=False)
 
 
 def handle_ob(ob, shared_memory):
-    non_shared = {}
+    non_shared = OrderedDict({})
     for k, v in ob.items():
         if isinstance(v, torch.Tensor):
             shared_memory[k].copy_(v)
@@ -113,8 +125,14 @@ def handle_ob(ob, shared_memory):
         elif isinstance(v, dict):
             for nk, nv in v.items():
                 if isinstance(nv, dict):
-                    raise NotImplementedError('Nested obs space dict not implemented')
-                shared_memory[k][nk] = torch.from_numpy(nv)
+                    dd = OrderedDict({})
+                    for dk, dv in nv.items():
+                        if isinstance(dv, dict):
+                            raise NotImplementedError('Double Nested obs space dict not implemented')
+                        else:
+                            shared_memory[k][dk].copy_(torch.from_numpy(dv))
+                else:
+                    shared_memory[k][nk].copy_(torch.from_numpy(nv))
         else:
             raise NotImplementedError('Unsupported obs type {}'.format(type(v)))
             # non_shared[k] = v

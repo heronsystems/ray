@@ -1,3 +1,4 @@
+from collections import OrderedDict, Iterable
 import json
 import os
 import logging
@@ -14,7 +15,7 @@ from ray.rllib.env.base_env import BaseEnv, _DUMMY_AGENT_ID, ASYNC_RESET_RETURN
 from .zmq_remote_worker import zmq_worker
 
 logger = logging.getLogger(__name__)
-ZMQ_CONNECT_METHOD = 'ipc'
+ZMQ_CONNECT_METHOD = 'tcp'
 
 
 class WorkerError(BaseException):
@@ -61,8 +62,16 @@ class ZMQRemoteVectorEnv(BaseEnv):
     def send_actions(self, action_dict):
         for env_id, actions in action_dict.items():
             socket = self._zmq_sockets[env_id]
-            # TODO: support nested action dict?
-            msg = json.dumps({k: v.item() for k, v in actions.items()})
+            a = {}
+            for k, v in actions.items():
+                # TODO: support nested action dict?
+                if isinstance(v, np.ndarray):
+                    a[k] = v.item()
+                elif isinstance(v, Iterable):
+                    a[k] = [x.item() for x in v]
+                else:
+                    a[k] = v.item()
+            msg = json.dumps(a)
             socket.send(msg.encode(), zmq.NOBLOCK, copy=False, track=False)
 
         self.waiting = True
@@ -141,16 +150,24 @@ class ZMQRemoteVectorEnv(BaseEnv):
 
     @staticmethod
     def _obs_to_numpy(obs):
-        o = {}
+        o = OrderedDict({})
         for k, v in obs.items():
             if isinstance(v, torch.Tensor):
                 o[k] = v.numpy()
             # support double layer dict
             elif isinstance(v, dict):
+                o[k] = OrderedDict({})
                 for nk, nv in v.items():
                     if isinstance(nv, dict):
-                        raise NotImplementedError('Nested obs space dict not implemented')
-                    o[k][nk] = nv.numpy()
+                        dd = OrderedDict({})
+                        for dk, dv in nv.items():
+                            if isinstance(dv, dict):
+                                raise NotImplementedError('Double Nested obs space dict not implemented')
+                            else:
+                                dd[dk] = dv.numpy()
+                        o[k][nk] = dd
+                    else:
+                        o[k][nk] = nv.numpy()
             else:
                 raise NotImplementedError('Unsupported obs type {}'.format(type(v)))
         return o
