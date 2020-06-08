@@ -445,7 +445,8 @@ def _numpy_frombuffer(buffer, dtype, shape, order):
     array = _frombuffer(buffer, dtype, shape, order)
     # Unfortunately, numpy does not follow the standard, so we still
     # have to set the readonly flag for it here.
-    array.setflags(write=isinstance(buffer, bytearray) or not buffer.readonly)
+    # array.setflags(write=isinstance(buffer, bytearray) or not buffer.readonly)
+    array.setflags(write=False)
     return array
 
 
